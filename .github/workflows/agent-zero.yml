@@ -1,0 +1,155 @@
+name: Agent Zero VM Deployment (Node.js 24)
+
+on: 
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    
+    steps:
+    - name: Checkout Repository (Node.js 24 Compatible)
+      uses: actions/checkout@v6
+      
+    - name: Setup Node.js 24
+      uses: actions/setup-node@v5
+      with:
+        node-version: '24'
+        check-latest: true
+      
+    - name: Setup System & Install Tools (2026 Fixed)
+      run: |
+        echo "========================================================"
+        echo "   AGENT ZERO // VM DEPLOYER // NODE.JS 24"
+        echo "========================================================"
+        echo "[INFO] Node.js version:"
+        node --version
+        # FIX (exit code 100): docker.io apt package REMOVED - it conflicts
+        # with the preinstalled docker-ce on GitHub ubuntu-latest runners.
+        echo "[INFO] Docker already available:"
+        docker --version
+        # FIX (exit code 100): apt-get upgrade -y REMOVED (slow + flaky).
+        # All required tools come preinstalled, so install only what is missing.
+        MISSING=""
+        for pkg in curl git jq openssl ripgrep ffmpeg; do
+          if ! command -v "$pkg" >/dev/null 2>&1; then
+            MISSING="$MISSING $pkg"
+          fi
+        done
+        if [ -n "$MISSING" ]; then
+          echo "[INFO] Installing missing tools:$MISSING"
+          sudo apt-get update -y
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends $MISSING
+        else
+          echo "[INFO] All required tools already preinstalled. Skipping apt (fix for exit code 100)."
+        fi
+        
+        sudo curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o /usr/local/bin/cloudflared
+        sudo chmod +x /usr/local/bin/cloudflared
+
+    - name: Pull Latest Agent Zero (2026 Edition)
+      run: |
+        echo "[INFO] Pulling latest Agent Zero Docker image..."
+        sudo docker pull agent0ai/agent-zero:latest
+        
+        echo "[INFO] Verifying image on disk..."
+        sudo docker image inspect agent0ai/agent-zero:latest --format 'Image ready: {{.Id}}'
+
+    - name: Launch Agent Zero Container (Full Root Access)
+      run: |
+        # PORT FIX: current agent0ai/agent-zero image serves its Web UI on
+        # container port 80 (official docs: docker run -p HOST:80).
+        # The old '-p 5080:5080' mapped to a port with nothing listening,
+        # so the readiness loop timed out and the step exited 1.
+        echo "[INFO] Running agent0ai/agent-zero container (host 5080 -> container 80)..."
+        sudo docker run -d --name agent-zero           -p 5080:80           -v a0_usr:/a0/usr           --privileged -v /:/host_root           agent0ai/agent-zero:latest
+        
+        echo "[INFO] Waiting for Agent Zero Web UI on port 5080 (up to ~4.5 min)..."
+        READY=0
+        for i in $(seq 1 90); do
+          if curl -s -I http://127.0.0.1:5080 > /dev/null 2>&1; then
+            echo "[SUCCESS] Agent Zero is actively running on port 5080!"
+            READY=1
+            break
+          fi
+          echo "Waiting for port 5080... ($i/90)"
+          if [ $((i % 15)) -eq 0 ]; then
+            echo "--- [DIAG] container state at check $i:"
+            sudo docker ps -a --filter name=agent-zero --format 'table {{.Names}}	{{.Status}}	{{.Ports}}'
+            sudo docker logs --tail 15 agent-zero 2>&1 | tail -15 || true
+          fi
+          sleep 3
+        done
+        
+        if [ $READY -eq 0 ]; then
+          echo "[ERROR] Agent Zero did not come up on port 5080. Full diagnostics:"
+          sudo docker ps -a --format 'table {{.Names}}	{{.Image}}	{{.Status}}	{{.Ports}}'
+          echo "[ERROR] Container logs (last 200 lines):"
+          sudo docker logs --tail 200 agent-zero 2>&1 || true
+          exit 1
+        fi
+        
+    - name: Establish Live Tunnel
+      run: |
+        echo "Starting Cloudflare tunnel on port 5080..."
+        # HARDENING: auto-heal if cloudflared binary is somehow missing.
+        if ! command -v cloudflared >/dev/null 2>&1; then
+          echo "[WARN] cloudflared not found - re-downloading..."
+          sudo curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o /usr/local/bin/cloudflared
+          sudo chmod +x /usr/local/bin/cloudflared
+        fi
+        nohup cloudflared tunnel --no-autoupdate --url http://127.0.0.1:5080 > /tmp/tunnel.log 2>&1 &
+        TUNNEL_URL=""
+        for i in $(seq 1 45); do
+          sleep 2
+          TUNNEL_URL=$(grep -oE "https://[a-zA-Z0-9-]+\.trycloudflare\.com" /tmp/tunnel.log | head -1 || true)
+          if [ -n "$TUNNEL_URL" ]; then
+            echo "TUNNEL_URL=$TUNNEL_URL" >> $GITHUB_ENV
+            break
+          fi
+        done
+        
+        if [ -z "$TUNNEL_URL" ]; then
+          echo "[ERROR] Tunnel could not be established. Tunnel log:"
+          cat /tmp/tunnel.log
+          exit 1
+        fi
+        
+        echo "### Agent Zero // Secure Web UI (2026)" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "**OPEN AGENT ZERO: $TUNNEL_URL**" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "| Setting | Value |" >> $GITHUB_STEP_SUMMARY
+        echo "|---|---|" >> $GITHUB_STEP_SUMMARY
+        echo "| Web UI | $TUNNEL_URL |" >> $GITHUB_STEP_SUMMARY
+        echo "| Host Port | 5080 (mapped to container port 80) |" >> $GITHUB_STEP_SUMMARY
+        echo "| Root Volume | /host_root (Full VM Control) |" >> $GITHUB_STEP_SUMMARY
+        echo "| User Data | a0_usr:/a0/usr |" >> $GITHUB_STEP_SUMMARY
+        echo "| Docker Image | agent0ai/agent-zero:latest |" >> $GITHUB_STEP_SUMMARY
+        
+        # FIX (exit code 127): workflow commands MUST be echoed. A bare
+        # '::notice ...' line is executed by bash as a command -> not found -> 127.
+        echo "::notice title=Agent Zero is LIVE::$TUNNEL_URL"
+        
+        echo "[SUCCESS] Agent Zero Tunnel Established!"
+        echo "==================================================="
+        echo "         AGENT ZERO SECURE WEB UI (2026)"
+        echo "==================================================="
+        echo "Web UI URL     : $TUNNEL_URL"
+        echo "Host Port      : 5080 (container port 80)"
+        echo "Root Volume    : /host_root (Full VM Control)"
+        echo "Node.js        : 24 (GitHub Actions)"
+        echo "Docker Image   : agent0ai/agent-zero:latest"
+        echo "==================================================="
+        
+    - name: Keep Alive Monitor
+      run: |
+        echo "Agent Zero session is active for 6 hours max..."
+        echo "Node.js 24 compatible deployment running..."
+        echo "Tunnel URL: $TUNNEL_URL"
+        for i in {358..1}; do
+            sleep 60
+        done
